@@ -3854,14 +3854,16 @@ mrb_str_to_i(mrb_state *mrb, mrb_value self)
 static double
 mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
 {
-  char buf[DBL_DIG * 4 + 20];
+  char sbuf[DBL_DIG * 4 + 20];
+  char *heap = NULL;
+  char *buf = sbuf;
   const char *p = s, *p2;
   const char *pend = p + len;
   char *end;
   char *n;
   char prev = 0;
   double d;
-  mrb_bool dot = FALSE;
+  mrb_bool need_copy = FALSE;
 
   if (!p) return 0.0;
   while (p<pend && ISSPACE(*p)) p++;
@@ -3893,30 +3895,41 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
       p = p2;
       goto nocopy;
     }
-    if (*p == '_') break;
+    if (*p == '_') {
+      need_copy = TRUE;
+      break;
+    }
     p++;
+  }
+  if (!need_copy) {
+    p = p2;
+    goto nocopy;
+  }
+  {
+    size_t bufsize = (size_t)(pend - p2) + 1;
+    if (bufsize > sizeof(sbuf)) {
+      buf = heap = (char*)mrb_malloc(mrb, bufsize);
+    }
   }
   p = p2;
   n = buf;
   while (p < pend) {
     char c = *p++;
-    if (c == '.') dot = TRUE;
     if (c == '_') {
       /* remove an underscore between digits */
       if (n == buf || !ISDIGIT(prev) || p == pend) {
-        if (badcheck) goto bad;
+        if (badcheck) {
+          if (heap) mrb_free(mrb, heap);
+          goto bad;
+        }
         break;
       }
     }
-    else if (badcheck && prev == '_' && !ISDIGIT(c)) goto bad;
-    else {
-      const char *bend = buf+sizeof(buf)-1;
-      if (n==bend) {            /* buffer overflow */
-        if (dot) break;         /* cut off remaining fractions */
-        return INFINITY;
-      }
-      *n++ = c;
+    else if (badcheck && prev == '_' && !ISDIGIT(c)) {
+      if (heap) mrb_free(mrb, heap);
+      goto bad;
     }
+    else *n++ = c;
     prev = c;
   }
   *n = '\0';
@@ -3924,6 +3937,7 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
   pend = n;
 nocopy:
   if (mrb_read_float(p, &end, &d) == FALSE) {
+    if (heap) mrb_free(mrb, heap);
     if (badcheck) {
 bad:
       mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid string for float(%!s)", s);
@@ -3932,10 +3946,17 @@ bad:
     return 0.0;
   }
   if (badcheck) {
-    if (!end || p == end) goto bad;
+    if (!end || p == end) {
+      if (heap) mrb_free(mrb, heap);
+      goto bad;
+    }
     while (end<pend && ISSPACE(*end)) end++;
-    if (end<pend) goto bad;
+    if (end<pend) {
+      if (heap) mrb_free(mrb, heap);
+      goto bad;
+    }
   }
+  if (heap) mrb_free(mrb, heap);
   return d;
 }
 
