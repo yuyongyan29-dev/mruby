@@ -3859,11 +3859,13 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
   char *buf = sbuf;
   const char *p = s, *p2;
   const char *pend = p + len;
+  const char *parse;
+  const char *parse_end;
   char *end;
   char *n;
   char prev = 0;
   double d;
-  mrb_bool need_copy = FALSE;
+  mrb_bool strip_us = FALSE;
 
   if (!p) return 0.0;
   while (p<pend && ISSPACE(*p)) p++;
@@ -3887,74 +3889,71 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
         /* not reached */
       }
       pend = p;
-      p = p2;
-      goto nocopy;
+      parse = p2;
+      parse_end = pend;
+      goto parse;
     }
     if (!badcheck && *p == ' ') {
       pend = p;
-      p = p2;
-      goto nocopy;
+      parse = p2;
+      parse_end = pend;
+      goto parse;
     }
     if (*p == '_') {
-      need_copy = TRUE;
+      strip_us = TRUE;
       break;
     }
     p++;
   }
-  if (!need_copy) {
-    p = p2;
-    goto nocopy;
-  }
   {
-    size_t bufsize = (size_t)(pend - p2) + 1;
-    if (bufsize > sizeof(sbuf)) {
+    size_t copylen = (size_t)(pend - p2);
+    size_t bufsize = copylen + 1;
+
+    if (bufsize > sizeof(sbuf))
       buf = heap = (char*)mrb_malloc(mrb, bufsize);
+    if (!strip_us) {
+      memcpy(buf, p2, copylen);
+      buf[copylen] = '\0';
+      parse = buf;
+      parse_end = buf + copylen;
     }
-  }
-  p = p2;
-  n = buf;
-  while (p < pend) {
-    char c = *p++;
-    if (c == '_') {
-      /* remove an underscore between digits */
-      if (n == buf || !ISDIGIT(prev) || p == pend) {
-        if (badcheck) {
-          if (heap) mrb_free(mrb, heap);
-          goto bad;
+    else {
+      p = p2;
+      n = buf;
+      while (p < pend) {
+        char c = *p++;
+
+        if (c == '_') {
+          /* remove an underscore between digits */
+          if (n == buf || !ISDIGIT(prev) || p == pend) {
+            if (badcheck) goto bad;
+            break;
+          }
         }
-        break;
+        else if (badcheck && prev == '_' && !ISDIGIT(c)) goto bad;
+        else *n++ = c;
+        prev = c;
       }
+      *n = '\0';
+      parse = buf;
+      parse_end = n;
     }
-    else if (badcheck && prev == '_' && !ISDIGIT(c)) {
-      if (heap) mrb_free(mrb, heap);
-      goto bad;
-    }
-    else *n++ = c;
-    prev = c;
   }
-  *n = '\0';
-  p = buf;
-  pend = n;
-nocopy:
-  if (mrb_read_float(p, &end, &d) == FALSE) {
-    if (heap) mrb_free(mrb, heap);
+parse:
+  if (mrb_read_float(parse, &end, &d) == FALSE) {
     if (badcheck) {
 bad:
+      if (heap) mrb_free(mrb, heap);
       mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid string for float(%!s)", s);
       /* not reached */
     }
+    if (heap) mrb_free(mrb, heap);
     return 0.0;
   }
   if (badcheck) {
-    if (!end || p == end) {
-      if (heap) mrb_free(mrb, heap);
-      goto bad;
-    }
-    while (end<pend && ISSPACE(*end)) end++;
-    if (end<pend) {
-      if (heap) mrb_free(mrb, heap);
-      goto bad;
-    }
+    if (!end || parse == end) goto bad;
+    while (end<parse_end && ISSPACE(*end)) end++;
+    if (end<parse_end) goto bad;
   }
   if (heap) mrb_free(mrb, heap);
   return d;

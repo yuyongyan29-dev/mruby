@@ -1495,6 +1495,14 @@ assert('String#to_f with long digit strings', '#7846') do
   assert_operator(1.2, :eql?, ("\t" + '0' * 100 + '1.2  junk').to_f)
 end if Object.const_defined?(:Float)
 
+assert('String#to_f on a shared substring', '#7846') do
+  s = '1' * 30 + '5' * 30
+  t = s[0, 30]
+  assert_operator(('1' * 30).to_f, :eql?, t.to_f)
+  u = ('9' * 40 + 'e5')[0, 40]
+  assert_operator(('9' * 40).to_f, :eql?, u.to_f)
+end if Object.const_defined?(:Float)
+
 assert('String#to_i', '15.2.10.5.39') do
   assert_operator 0, :eql?, ''.to_i
   assert_operator 32143, :eql?, '32143'.to_i
