@@ -112,6 +112,16 @@ assert('Struct#each', '15.2.18.4.4') do
     a << x
   }
   assert_equal [1, 2], a
+
+  if Object.const_defined?(:Enumerator)
+    e = cc.each
+    assert_true e.instance_of?(Enumerator)
+    assert_equal [1, 2], e.to_a
+    assert_equal '#<Enumerator: #<struct m1=1, m2=2>:each>', e.inspect
+
+    ret = cc.each {|x| }
+    assert_equal cc, ret
+  end
 end
 
 assert('Struct#each_pair', '15.2.18.4.5') do
@@ -122,6 +132,16 @@ assert('Struct#each_pair', '15.2.18.4.5') do
     a << [k,v]
   }
   assert_equal [[:m1, 1], [:m2, 2]], a
+
+  if Object.const_defined?(:Enumerator)
+    e = cc.each_pair
+    assert_true e.instance_of?(Enumerator)
+    assert_equal [[:m1, 1], [:m2, 2]], e.to_a
+    assert_equal '#<Enumerator: #<struct m1=1, m2=2>:each_pair>', e.inspect
+
+    ret = cc.each_pair {|k, v| }
+    assert_equal cc, ret
+  end
 end
 
 assert('Struct#members', '15.2.18.4.6') do
@@ -132,6 +152,48 @@ end
 assert('Struct#select', '15.2.18.4.7') do
   c = Struct.new(:m1, :m2)
   assert_equal([2]) { c.new(1,2).select{|v| v % 2 == 0} }
+
+  if Object.const_defined?(:Enumerator)
+    cc = c.new(1, 2)
+    e = cc.select
+    assert_true e.instance_of?(Enumerator)
+    assert_equal '#<Enumerator: #<struct m1=1, m2=2>:select>', e.inspect
+    a = []
+    e.each {|v| a << v }
+    assert_equal [1, 2], a
+  end
+end
+
+assert('Struct#each/each_pair/select without a block on empty and single-member structs') do
+  skip unless Object.const_defined?(:Enumerator)
+  empty = Struct.new.new
+  assert_true empty.each.instance_of?(Enumerator)
+  assert_equal [], empty.each.to_a
+  assert_true empty.each_pair.instance_of?(Enumerator)
+  assert_equal [], empty.each_pair.to_a
+  assert_true empty.select.instance_of?(Enumerator)
+  assert_equal [], empty.select.each.to_a
+
+  one = Struct.new(:only).new(42)
+  assert_equal [42], one.each.to_a
+  assert_equal [[:only, 42]], one.each_pair.to_a
+  a = []
+  one.select.each {|v| a << v }
+  assert_equal [42], a
+end
+
+assert('Struct#each/each_pair/select without a block: Enumerable and to_enum unchanged') do
+  skip unless Object.const_defined?(:Enumerator)
+  c = Struct.new(:m1, :m2)
+  cc = c.new(1, 2)
+  assert_equal({:m1 => 1, :m2 => 2}, cc.to_h)
+  assert_kind_of Enumerator, cc.map
+  assert_kind_of Enumerator, cc.reject
+  assert_kind_of Enumerator, cc.each_with_index
+  assert_kind_of Enumerator, cc.find
+  assert_kind_of Enumerator, cc.to_enum
+  assert_kind_of Enumerator, cc.enum_for
+  assert_equal [1, 2], cc.to_enum(:each).to_a
 end
 
 assert('large struct') do
