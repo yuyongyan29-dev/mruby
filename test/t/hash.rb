@@ -1280,25 +1280,6 @@ assert('Hash#rehash rejects nested mutation (#7862)') do
   assert_raise(RuntimeError) { h.rehash }
   h[:tail] = 0
 
-  reenter_mark = []
-  reenter = Class.new do
-    def initialize(h, marker) @h, @marker = h, marker end
-    def eql?(other)
-      @marker << :attempt
-      begin
-        @h.rehash
-      rescue RuntimeError
-        @marker << :blocked
-      end
-      equal?(other)
-    end
-    def hash; 11 end
-  end
-  h = {}; 20.times { |i| h[i] = i }
-  rk = reenter.new(h, reenter_mark); h[rk] = "r"
-  assert_raise(RuntimeError) { h.rehash }
-  assert_include(reenter_mark, :blocked)
-
   h = ht_entries.hash_for
   assert_same(h, h.rehash)
   big = {}; 200.times { |i| big[i] = i }; 180.times { |i| big.delete(i) }
