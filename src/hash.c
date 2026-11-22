@@ -13,7 +13,10 @@
 #include <mruby/variable.h>
 #include <mruby/proc.h>
 #include <mruby/internal.h>
+#include <mruby/throw.h>
 
+/* Transient flag while h_rehash runs; not part of the public hash API. */
+#define MRB_HASH_REHASHING (1 << (MRB_HASH_SIZE_FLAGS_SHIFT + 4))
 
 /*
  * === Glossary
@@ -501,6 +504,36 @@ entry_check_vacated(mrb_state *mrb, const hash_entry *entry, mrb_value stored)
   }
 }
 
+static void
+ar_rehash_state_check(mrb_state *mrb, struct RHash *h, hash_entry *ea, uint32_t ea_capa,
+                      uint32_t size)
+{
+  if (!h_ar_p(h) || ar_ea(h) != ea || ar_ea_capa(h) != ea_capa ||
+      ar_size(h) != size) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+/* Snapshot taken after ht_init rebuilds the index; do not compare h_ht. */
+static void
+ht_rehash_state_check(mrb_state *mrb, struct RHash *h, hash_entry *ea, uint32_t ea_capa,
+                      uint32_t size, uint32_t ea_n_used)
+{
+  if (h_ar_p(h) || ht_ea(h) != ea || ht_ea_capa(h) != ea_capa ||
+      ht_size(h) != size || ht_ea_n_used(h) != ea_n_used) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+/* Refuse nested work that would grow the entry array or rebuild the table. */
+static void
+h_rehash_refuse_nested_grow(mrb_state *mrb, struct RHash *h)
+{
+  if (h->flags & MRB_HASH_REHASHING) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
 static mrb_bool
 entry_key_eql(mrb_state *mrb, struct RHash *h, hash_entry *entry, mrb_value key)
 {
@@ -705,15 +738,18 @@ ar_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
     if (ea_capa == ea_n_used) {
       if (size == ea_n_used) {
         if (size == AR_MAX_SIZE) {
+          h_rehash_refuse_nested_grow(mrb, h);
           ht_init(mrb, h, size, ar_ea(h), ea_capa, NULL, IB_INIT_BIT);
           ht_set(mrb, h, key, val);
           return;
         }
         else {
+          h_rehash_refuse_nested_grow(mrb, h);
           ar_adjust_ea(mrb, h, size, AR_MAX_SIZE);
         }
       }
       else {
+        h_rehash_refuse_nested_grow(mrb, h);
         ar_compress(mrb, h);
         ea_n_used = size;
       }
@@ -768,6 +804,7 @@ ar_rehash(mrb_state *mrb, struct RHash *h)
     mrb_value key = r_entry->key;
     w_entry = ea_get_by_key(mrb, ea, ea_capa, w_size, key, h);
     entry_check_vacated(mrb, r_entry, key);
+    ar_rehash_state_check(mrb, h, ea, ea_capa, size);
     if (w_entry) {
       w_entry->val = r_entry->val;
       ar_set_size(h, --size);
@@ -1058,6 +1095,7 @@ ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
   uint32_t size = ht_size(h);
   uint32_t ib_bit_width = ib_bit(h), ib_capa = ib_bit_to_capa(ib_bit_width);
   if (ib_upper_bound_for(ib_capa) <= size) {
+    h_rehash_refuse_nested_grow(mrb, h);
     if (size != ht_ea_n_used(h)) ea_compress(ht_ea(h), ht_ea_n_used(h));
     ht_init(mrb, h, size, ht_ea(h), ht_ea_capa(h), h_ht(h), ++ib_bit_width);
   }
@@ -1065,12 +1103,14 @@ ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
     if (ib_capa - EA_N_RESERVED_INDICES <= ht_ea_n_used(h)) goto compress;
     if (ht_ea_capa(h) == ht_ea_n_used(h)) {
       if (size <= AR_MAX_SIZE) {
+        h_rehash_refuse_nested_grow(mrb, h);
         ht_set_as_ar(mrb, h, key, val);
         return;
       }
       if (ea_next_capa_for(size, EA_MAX_CAPA) <= ht_ea_capa(h)) {
        compress:
         ea_compress(ht_ea(h), ht_ea_n_used(h));
+        h_rehash_refuse_nested_grow(mrb, h);
         ht_adjust_ea(mrb, h, size, ht_ea_capa(h));
         ht_init(mrb, h, size, ht_ea(h), ht_ea_capa(h), h_ht(h), ib_bit_width);
       }
@@ -1093,7 +1133,10 @@ ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
         mrb_raise(mrb, E_ARGUMENT_ERROR, "hash too big");
       }
       key = h_key_for(mrb, h, key);
-      if (ea_n_used == ht_ea_capa(h)) ht_adjust_ea(mrb, h, ea_n_used, EA_MAX_CAPA);
+      if (ea_n_used == ht_ea_capa(h)) {
+        h_rehash_refuse_nested_grow(mrb, h);
+        ht_adjust_ea(mrb, h, ea_n_used, EA_MAX_CAPA);
+      }
       ib_it_set(it, ea_n_used);
       ea_set(ht_ea(h), ea_n_used, key, val);
       ht_inc_size(h);
@@ -1151,7 +1194,8 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
   hash_entry *ea = ht_ea(h);
   ht_init(mrb, h, 0, ea, ea_capa, h_ht(h), ib_bit_for(size));
   ht_set_size(h, size);
-  ht_set_ea_n_used(h, ht_ea_n_used(h));
+  uint32_t ea_n_used = ht_ea_n_used(h);
+  ht_set_ea_n_used(h, ea_n_used);
   EA_EACH(ea, ea_capa, size, r_entry) {
     /* the cycle asks this entry's own key for its hash code, and the key it
        meets answers #eql?: Ruby in either can vacate the slot the pair is
@@ -1161,12 +1205,14 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
       if (ib_it_active_p(it)) {
         if (!entry_holds_key_p(mrb, h, ib_it_entry(it), key)) continue;
         entry_check_vacated(mrb, r_entry, key);
+        ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
         ib_it_entry(it)->val = r_entry->val;
         ht_set_size(h, --size);
         entry_delete(r_entry);
       }
       else {
         entry_check_vacated(mrb, r_entry, key);
+        ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
         if (w_size != U32(r_entry - ea)) {
           ea_set(ea, w_size, key, r_entry->val);
           entry_delete(r_entry);
@@ -1175,6 +1221,7 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
       }
       break;
     }
+    ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
   }
   mrb_assert(size == w_size);
   ht_set_ea_n_used(h, size);
@@ -1264,7 +1311,29 @@ h_rehash(mrb_state *mrb, struct RHash *h)
    *   delete the slot before moving when moving the entry, and update size
    *   at any time when overwriting.
    */
-  (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    h->flags |= MRB_HASH_REHASHING;
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+      mrb->jmp = prev_jmp;
+      h->flags &= ~MRB_HASH_REHASHING;
+    }
+    MRB_CATCH(&c_jmp) {
+      h->flags &= ~MRB_HASH_REHASHING;
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    }
+    MRB_END_EXC(&c_jmp);
+  }
+  else {
+    h->flags |= MRB_HASH_REHASHING;
+    (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+    h->flags &= ~MRB_HASH_REHASHING;
+  }
 }
 
 static void
