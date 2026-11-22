@@ -1223,6 +1223,90 @@ assert('Hash scans that read the entry back after a callback') do
   assert_true(h.key?(:added))
 end
 
+assert('Hash#rehash rejects nested mutation (#7862)') do
+  marker = []
+  swapper = Class.new do
+    attr_accessor :armed
+    def initialize(h, marker) @h, @marker, @armed = h, marker, false end
+    def fire
+      return unless @armed
+      @armed = false
+      @marker << :eql
+      @h[:d] = 0
+    end
+    def eql?(other)
+      fire
+      equal?(other)
+    end
+    def hash; end
+  end
+  h = { a: "", b: "", c: "" }
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, marker)
+  h[k] = k = swapper.new(h, marker)
+  h[k] = ""
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  assert_equal([:eql], marker)
+  h[:after_assign] = 1
+
+  grower = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      40.times { |i| @h[300 + i] = i } if @armed
+      equal?(other)
+    end
+    def hash; 12_345 end
+  end
+  h = {}; 22.times { |i| h[i] = i }
+  k = grower.new(h); h[k] = 1; k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  packer = Class.new do
+    attr_accessor :armed
+    def initialize(h, n) @h, @armed, @n = h, false, n end
+    def eql?(other)
+      if @armed
+        @armed = false
+        @n.times { |i| @h[1000 + i] = i }
+      end
+      equal?(other)
+    end
+    def hash; 12_345 end
+  end
+  h = {}; 22.times { |i| h[i] = i }
+  k = packer.new(h, 40); h[k] = "v"; k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  h[:tail] = 0
+
+  reenter_mark = []
+  reenter = Class.new do
+    def initialize(h, marker) @h, @marker = h, marker end
+    def eql?(other)
+      @marker << :attempt
+      begin
+        @h.rehash
+      rescue RuntimeError
+        @marker << :blocked
+      end
+      equal?(other)
+    end
+    def hash; 11 end
+  end
+  h = {}; 20.times { |i| h[i] = i }
+  rk = reenter.new(h, reenter_mark); h[rk] = "r"
+  assert_raise(RuntimeError) { h.rehash }
+  assert_include(reenter_mark, :blocked)
+
+  h = ht_entries.hash_for
+  assert_same(h, h.rehash)
+  big = {}; 200.times { |i| big[i] = i }; 180.times { |i| big.delete(i) }
+  assert_same(big, big.rehash)
+  cbi = { 1 => :a, "x" => :b }; cbi.compare_by_identity
+  assert_equal(:a, cbi[1])
+end
+
 assert('Hash scans that carry a pair into a set the hash no longer holds') do
   # A scan that stores the pair it is standing on somewhere else hands it to a
   # set, and the set asks the key for its hash code before it stores anything.
