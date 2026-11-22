@@ -13,6 +13,7 @@
 #include <mruby/variable.h>
 #include <mruby/proc.h>
 #include <mruby/internal.h>
+#include <mruby/throw.h>
 
 
 /*
@@ -501,6 +502,26 @@ entry_check_vacated(mrb_state *mrb, const hash_entry *entry, mrb_value stored)
   }
 }
 
+static void
+ar_rehash_state_check(mrb_state *mrb, struct RHash *h, hash_entry *ea, uint32_t ea_capa,
+                      uint32_t size)
+{
+  if (!h_ar_p(h) || ar_ea(h) != ea || ar_ea_capa(h) != ea_capa ||
+      ar_size(h) != size) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+static void
+ht_rehash_state_check(mrb_state *mrb, struct RHash *h, hash_entry *ea, uint32_t ea_capa,
+                      uint32_t size, uint32_t ea_n_used)
+{
+  if (h_ar_p(h) || ht_ea(h) != ea || ht_ea_capa(h) != ea_capa ||
+      ht_size(h) != size || ht_ea_n_used(h) != ea_n_used) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
 static mrb_bool
 entry_key_eql(mrb_state *mrb, struct RHash *h, hash_entry *entry, mrb_value key)
 {
@@ -768,6 +789,7 @@ ar_rehash(mrb_state *mrb, struct RHash *h)
     mrb_value key = r_entry->key;
     w_entry = ea_get_by_key(mrb, ea, ea_capa, w_size, key, h);
     entry_check_vacated(mrb, r_entry, key);
+    ar_rehash_state_check(mrb, h, ea, ea_capa, size);
     if (w_entry) {
       w_entry->val = r_entry->val;
       ar_set_size(h, --size);
@@ -1151,7 +1173,8 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
   hash_entry *ea = ht_ea(h);
   ht_init(mrb, h, 0, ea, ea_capa, h_ht(h), ib_bit_for(size));
   ht_set_size(h, size);
-  ht_set_ea_n_used(h, ht_ea_n_used(h));
+  uint32_t ea_n_used = ht_ea_n_used(h);
+  ht_set_ea_n_used(h, ea_n_used);
   EA_EACH(ea, ea_capa, size, r_entry) {
     /* the cycle asks this entry's own key for its hash code, and the key it
        meets answers #eql?: Ruby in either can vacate the slot the pair is
@@ -1161,12 +1184,14 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
       if (ib_it_active_p(it)) {
         if (!entry_holds_key_p(mrb, h, ib_it_entry(it), key)) continue;
         entry_check_vacated(mrb, r_entry, key);
+        ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
         ib_it_entry(it)->val = r_entry->val;
         ht_set_size(h, --size);
         entry_delete(r_entry);
       }
       else {
         entry_check_vacated(mrb, r_entry, key);
+        ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
         if (w_size != U32(r_entry - ea)) {
           ea_set(ea, w_size, key, r_entry->val);
           entry_delete(r_entry);
@@ -1175,6 +1200,7 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
       }
       break;
     }
+    ht_rehash_state_check(mrb, h, ea, ea_capa, size, ea_n_used);
   }
   mrb_assert(size == w_size);
   ht_set_ea_n_used(h, size);
@@ -1235,6 +1261,9 @@ h_get(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value *valp)
 static void
 h_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
 {
+  if (h->flags & MRB_HASH_REHASHING) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
   (h_ar_p(h) ? ar_set : ht_set)(mrb, h, key, val);
 }
 
@@ -1264,7 +1293,29 @@ h_rehash(mrb_state *mrb, struct RHash *h)
    *   delete the slot before moving when moving the entry, and update size
    *   at any time when overwriting.
    */
-  (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    h->flags |= MRB_HASH_REHASHING;
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+      mrb->jmp = prev_jmp;
+      h->flags &= ~MRB_HASH_REHASHING;
+    }
+    MRB_CATCH(&c_jmp) {
+      h->flags &= ~MRB_HASH_REHASHING;
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    }
+    MRB_END_EXC(&c_jmp);
+  }
+  else {
+    h->flags |= MRB_HASH_REHASHING;
+    (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+    h->flags &= ~MRB_HASH_REHASHING;
+  }
 }
 
 static void

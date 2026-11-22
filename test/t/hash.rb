@@ -1218,9 +1218,51 @@ assert('Hash scans that read the entry back after a callback') do
   h[k] = "dup"
   k.armed = true
   assert_raise(RuntimeError) { h.rehash }
-  # What a rehash stopped part way through leaves is what it left before: the
-  # entries it had not reached yet are out of the index it is rebuilding.
-  assert_true(h.key?(:added))
+  # Nested stores during rehash are refused; a delete ahead of the cursor can
+  # still run, but the insert this callback attempted does not land.
+  assert_false(h.key?(:added))
+end
+
+assert('Hash#rehash rejects nested mutation (#7862)') do
+  grower = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      40.times { |i| @h[300 + i] = i } if @armed
+      equal?(other)
+    end
+    def hash; 12_345 end
+  end
+  h = {}; 22.times { |i| h[i] = i }
+  k = grower.new(h); h[k] = 1; k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  marker = []
+  swapper = Class.new do
+    attr_accessor :armed
+    def initialize(h, marker) @h, @marker, @armed = h, marker, false end
+    def eql?(other)
+      if @armed
+        @armed = false
+        @marker << :eql
+        @h[:d] = 0
+      end
+      equal?(other)
+    end
+    def hash; end
+  end
+  h = { a: "", b: "", c: "" }
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, marker)
+  h[k] = k = swapper.new(h, marker); h[k] = ""; k.armed = true
+  begin; h.rehash; rescue RuntimeError; end
+  assert_equal([:eql], marker)
+  h[:tail] = 0
+  h = ht_entries.hash_for
+  assert_same(h, h.rehash)
+  big = {}; 200.times { |i| big[i] = i }; 180.times { |i| big.delete(i) }
+  assert_same(big, big.rehash)
+  cbi = { 1 => :a, "x" => :b }; cbi.compare_by_identity
+  assert_equal(:a, cbi[1])
 end
 
 assert('Hash scans that carry a pair into a set the hash no longer holds') do
