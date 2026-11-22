@@ -1223,6 +1223,106 @@ assert('Hash scans that read the entry back after a callback') do
   assert_true(h.key?(:added))
 end
 
+assert('Hash#rehash with nested insert from a key callback') do
+  # Regression for #7862: during indexed (HT) rehash, `eql?` or `hash` can insert
+  # into the same hash, reallocating the entry array or rebuilding the index
+  # table. Rehash must not keep writing through the EA pointer it cached.
+  InsertOnEql = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def fire
+      return unless @armed
+      @h[:d] = 0
+    end
+    def eql?(other)
+      fire
+      equal?(other)
+    end
+    def hash; end
+  end
+
+  h = { a: "", b: "", c: "" }
+  20.times { |i| h[i] = i }
+  k = InsertOnEql.new(h)
+  h[k] = k = InsertOnEql.new(h)
+  h[k] = ""
+  k.armed = true
+
+  assert_raise(RuntimeError) { h.rehash }
+
+  # The grammarinator driver (rescued `rehash`, then assignment) is covered by
+  # test/repro_7862.rb under an ASan build; a rescued failed rehash can leave a
+  # inconsistent table, so the driver is not run here in-process.
+
+  InsertOnHash = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def fire
+      return unless @armed
+      @h[:d] = 0
+    end
+    def eql?(other) equal?(other) end
+    def hash
+      fire
+      0
+    end
+  end
+  h = {}
+  20.times { |i| h[i] = i }
+  hit = InsertOnHash.new(h)
+  h[hit] = "value"
+  hit.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  DeleteOnEql = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      @h.delete(0) if @armed
+      equal?(other)
+    end
+    def hash; 42 end
+  end
+  h = {}
+  20.times { |i| h[i] = i }
+  d = DeleteOnEql.new(h)
+  h[d] = "v"
+  d.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  GrowOnEql = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      if @armed
+        @armed = false
+        @h[:extra] = 1
+      end
+      equal?(other)
+    end
+    def hash; 42 end
+  end
+  h = {}
+  20.times { |i| h[i] = i }
+  gk = GrowOnEql.new(h)
+  h[gk] = "v"
+  gk.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  setter = Class.new do
+    def initialize(h) @h = h end
+    def eql?(other)
+      @h[:nested] = 1
+      equal?(other)
+    end
+    def hash; 99 end
+  end
+  g = {}
+  20.times { |i| g[i] = i }
+  sk = setter.new(g)
+  assert_raise(RuntimeError) { g[sk] = "v" }
+end
+
 assert('Hash scans that carry a pair into a set the hash no longer holds') do
   # A scan that stores the pair it is standing on somewhere else hands it to a
   # set, and the set asks the key for its hash code before it stores anything.
