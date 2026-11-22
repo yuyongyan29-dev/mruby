@@ -13,6 +13,8 @@
 #include <mruby/variable.h>
 #include <mruby/proc.h>
 #include <mruby/internal.h>
+#include <mruby/throw.h>
+#include <mruby/error.h>
 
 
 /*
@@ -70,6 +72,27 @@
 #define AR_DEFAULT_CAPA 4
 #define AR_MAX_SIZE 16
 #define H_MAX_SIZE EA_MAX_CAPA
+
+#define H_REHASH_FRAME_TAG 0x48524853u /* HRHS */
+
+
+typedef struct h_rehash_frame {
+  uint32_t tag;
+  void *saved_ud;
+  struct RHash *h;
+  struct h_rehash_frame *rehash_below;
+} h_rehash_frame;
+
+static h_rehash_frame*
+h_rehash_frame_top(mrb_state *mrb)
+{
+  void *ud = mrb->ud;
+
+  if (ud && ((const h_rehash_frame*)ud)->tag == H_REHASH_FRAME_TAG) {
+    return (h_rehash_frame*)ud;
+  }
+  return NULL;
+}
 
 mrb_static_assert(offsetof(struct RHash, iv) == offsetof(struct RObject, iv));
 mrb_static_assert(AR_MAX_SIZE < (1 << MRB_HASH_AR_EA_CAPA_BIT));
@@ -294,6 +317,8 @@ static void ht_init(
   hash_entry *ea, uint32_t ea_capa, hash_table *ht, uint32_t ib_bit);
 static void ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val);
 static mrb_value h_key_for(mrb_state *mrb, struct RHash *h, mrb_value key);
+static void h_free_table(mrb_state *mrb, struct RHash *h);
+static void h_rehash_frame_pop(mrb_state *mrb, h_rehash_frame *frame);
 
 static uint32_t
 next_power2(uint32_t v)
@@ -325,6 +350,15 @@ struct h_check_modified {
   uint32_t size;
 };
 
+struct h_rehash_snap {
+  uint32_t flags;
+  void *tbl;
+  uint32_t ht_ea_capa;
+  hash_entry *ht_ea;
+  uint32_t size;
+  uint32_t ea_n_used;
+};
+
 #define H_CHECK_MODIFIED_FLAGS_MASK  (MRB_HASH_HT | MRB_HASH_IB_BIT_MASK | MRB_HASH_AR_EA_CAPA_MASK)
 
 static struct h_check_modified
@@ -351,6 +385,38 @@ h_check_modified_validate(mrb_state *mrb, struct h_check_modified *checker, stru
       ((H_CHECK_MODIFIED_USE_HT_EA_FOR_AR || h_ht_p(h)) &&
        checker->ht_ea != ht_ea(h)) ||
       checker->size != h_size(h)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+static struct h_rehash_snap
+h_rehash_snap_init(mrb_state *mrb, struct RHash *h)
+{
+  struct h_check_modified base = h_check_modified_init(mrb, h);
+  struct h_rehash_snap snap;
+
+  (void)mrb;
+  snap.flags = base.flags;
+  snap.tbl = base.tbl;
+  snap.ht_ea_capa = base.ht_ea_capa;
+  snap.ht_ea = base.ht_ea;
+  snap.size = base.size;
+  snap.ea_n_used = h_ar_p(h) ? ar_ea_n_used(h) : ht_ea_n_used(h);
+  return snap;
+}
+
+static void
+h_rehash_snap_validate(mrb_state *mrb, struct h_rehash_snap *snap, struct RHash *h)
+{
+  struct h_check_modified checker;
+
+  checker.flags = snap->flags;
+  checker.tbl = snap->tbl;
+  checker.ht_ea_capa = snap->ht_ea_capa;
+  checker.ht_ea = snap->ht_ea;
+  checker.size = snap->size;
+  h_check_modified_validate(mrb, &checker, h);
+  if (snap->ea_n_used != (h_ar_p(h) ? ar_ea_n_used(h) : ht_ea_n_used(h))) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
   }
 }
@@ -755,35 +821,109 @@ ar_shift(mrb_state *mrb, struct RHash *h, mrb_value *keyp, mrb_value *valp)
   }
 }
 
+typedef struct {
+  struct RHash *h;
+  hash_entry *new_ea;
+  uint32_t new_capa;
+  uint32_t *w_size;
+  hash_entry *r_entry;
+} ar_rehash_ctx;
+
+static mrb_value
+ar_rehash_step_body(mrb_state *mrb, void *userdata)
+{
+  ar_rehash_ctx *step = (ar_rehash_ctx*)userdata;
+  hash_entry *r_entry = step->r_entry;
+  mrb_value key = r_entry->key;
+  hash_entry *w_entry;
+
+  entry_check_vacated(mrb, r_entry, key);
+  w_entry = ea_get_by_key(mrb, step->new_ea, step->new_capa, *step->w_size, key, step->h);
+  if (w_entry) {
+    w_entry->val = r_entry->val;
+  }
+  else {
+    ea_set(step->new_ea, *step->w_size, key, r_entry->val);
+    (*step->w_size)++;
+  }
+  return mrb_nil_value();
+}
+
+static void
+ar_rehash_step(mrb_state *mrb, ar_rehash_ctx *step, hash_entry *new_ea)
+{
+  mrb_bool err = FALSE;
+  mrb_value exc;
+
+  if (!mrb->jmp) {
+    ar_rehash_step_body(mrb, step);
+    return;
+  }
+  exc = mrb_protect_error(mrb, ar_rehash_step_body, step, &err);
+  if (err) {
+    (void)exc;
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+static void
+ar_rehash_finish(mrb_state *mrb, struct RHash *h, struct h_rehash_snap *snap,
+                 hash_entry *new_ea, uint32_t new_capa, uint32_t w_size)
+{
+  h_rehash_snap_validate(mrb, snap, h);
+  hash_entry *old_ea = ar_ea(h);
+  ar_init(h, w_size, new_ea, new_capa, w_size);
+  ar_adjust_ea(mrb, h, w_size, lesser(new_capa, AR_MAX_SIZE));
+  mrb_free(mrb, old_ea);
+}
+
 static void
 ar_rehash(mrb_state *mrb, struct RHash *h)
 {
-  /* see comments in `h_rehash` */
-  uint32_t size = ar_size(h), w_size = 0, ea_capa = ar_ea_capa(h);
-  hash_entry *ea = ar_ea(h), *w_entry;
-  EA_EACH(ea, ea_capa, size, r_entry) {
-    /* the search carries this entry's own key, and the keys already written
-       answer #eql?: Ruby there can vacate the slot the pair is still to be
-       read from */
-    mrb_value key = r_entry->key;
-    w_entry = ea_get_by_key(mrb, ea, ea_capa, w_size, key, h);
-    entry_check_vacated(mrb, r_entry, key);
-    if (w_entry) {
-      w_entry->val = r_entry->val;
-      ar_set_size(h, --size);
-      entry_delete(r_entry);
-    }
-    else {
-      if (w_size != U32(r_entry - ea)) {
-        ea_set(ea, w_size, key, r_entry->val);
-        entry_delete(r_entry);
-      }
-      w_size++;
-    }
+  uint32_t size = ar_size(h);
+  if (size == 0) return;
+
+  struct h_rehash_snap snap = h_rehash_snap_init(mrb, h);
+  if (!snap.tbl) return;
+
+  hash_entry *old_ea = ar_ea(h);
+  uint32_t old_capa = ar_ea_capa(h);
+  uint32_t new_capa = size;
+  hash_entry *new_ea = (hash_entry*)mrb_malloc(mrb, sizeof(hash_entry) * new_capa);
+  for (uint32_t i = 0; i < new_capa; i++) {
+    entry_delete(&new_ea[i]);
   }
-  mrb_assert(size == w_size);
-  ar_set_ea_n_used(h, size);
-  ar_adjust_ea(mrb, h, size, ea_capa);
+
+  uint32_t w_size = 0;
+  ar_rehash_ctx step = { h, new_ea, new_capa, &w_size, NULL };
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      EA_EACH(old_ea, old_capa, size, r_entry) {
+        step.r_entry = r_entry;
+        ar_rehash_step(mrb, &step, new_ea);
+      }
+      ar_rehash_finish(mrb, h, &snap, new_ea, new_capa, w_size);
+      mrb->jmp = prev_jmp;
+    }
+    MRB_CATCH(&c_jmp) {
+      h_rehash_frame_pop(mrb, h_rehash_frame_top(mrb));
+      mrb_free(mrb, new_ea);
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    }
+    MRB_END_EXC(&c_jmp);
+  }
+  else {
+    EA_EACH(old_ea, old_capa, size, r_entry) {
+      step.r_entry = r_entry;
+      ar_rehash_step_body(mrb, &step);
+    }
+    ar_rehash_finish(mrb, h, &snap, new_ea, new_capa, w_size);
+  }
 }
 
 static uint32_t
@@ -1137,48 +1277,212 @@ ht_shift(mrb_state *mrb, struct RHash *h, mrb_value *keyp, mrb_value *valp)
   }
 }
 
+static struct RHash
+ht_rehash_shadow(mrb_state *mrb, struct RHash *h, hash_table *new_ht, hash_entry *new_ea,
+                 uint32_t new_capa, uint32_t ib_bit, size_t ib_byte_size)
+{
+  struct RHash build = *h;
+
+  h_ht_on(&build);
+  h_set_ht(&build, new_ht);
+  ht_set_ea(&build, new_ea);
+  ht_set_ea_capa(&build, new_capa);
+  ht_set_size(&build, 0);
+  ht_set_ea_n_used(&build, 0);
+  ib_init(mrb, &build, ib_bit, ib_byte_size);
+  return build;
+}
+
+static void
+ht_rehash_install_ar(mrb_state *mrb, struct RHash *h, hash_entry *new_ea, uint32_t w_size, uint32_t new_capa)
+{
+  h_free_table(mrb, h);
+  ar_init(h, w_size, new_ea, new_capa, w_size);
+  ar_adjust_ea(mrb, h, w_size, lesser(new_capa, AR_MAX_SIZE));
+}
+
+static void
+ht_rehash_install_ht(mrb_state *mrb, struct RHash *h, hash_entry *new_ea, uint32_t new_capa,
+                     hash_table *new_ht, uint32_t w_size)
+{
+  h_free_table(mrb, h);
+  h_ht_on(h);
+  h_set_ht(h, new_ht);
+  ht_set_ea(h, new_ea);
+  ht_set_ea_capa(h, new_capa);
+  ht_set_size(h, w_size);
+  ht_set_ea_n_used(h, w_size);
+  ht_adjust_ea(mrb, h, w_size, new_capa);
+}
+
+typedef struct {
+  struct RHash *h;
+  struct RHash *build;
+  hash_entry *new_ea;
+  uint32_t *w_size;
+  hash_entry *r_entry;
+} ht_rehash_ctx;
+
+static mrb_value
+ht_rehash_step_body(mrb_state *mrb, void *userdata)
+{
+  ht_rehash_ctx *step = (ht_rehash_ctx*)userdata;
+  hash_entry *r_entry = step->r_entry;
+  mrb_value key = r_entry->key;
+
+  IB_CYCLE_BY_KEY(mrb, step->build, key, it) {
+    if (ib_it_active_p(it)) {
+      if (!entry_holds_key_p(mrb, step->h, ib_it_entry(it), key)) continue;
+      entry_check_vacated(mrb, r_entry, key);
+      ib_it_entry(it)->val = r_entry->val;
+    }
+    else if (!ib_it_deleted_p(it)) {
+      entry_check_vacated(mrb, r_entry, key);
+      ea_set(step->new_ea, *step->w_size, key, r_entry->val);
+      ib_it_set(it, *step->w_size);
+      ht_set_size(step->build, ++(*step->w_size));
+      ht_set_ea_n_used(step->build, *step->w_size);
+    }
+    break;
+  }
+  return mrb_nil_value();
+}
+
+static void
+ht_rehash_step(mrb_state *mrb, ht_rehash_ctx *step, hash_entry *new_ea, hash_table *new_ht)
+{
+  mrb_bool err = FALSE;
+  mrb_value exc;
+
+  if (!mrb->jmp) {
+    ht_rehash_step_body(mrb, step);
+    return;
+  }
+  exc = mrb_protect_error(mrb, ht_rehash_step_body, step, &err);
+  if (err) {
+    (void)exc;
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+static void
+ht_rehash_body(mrb_state *mrb, struct RHash *h, struct h_rehash_snap *snap,
+               hash_entry *new_ea, uint32_t new_capa, hash_table *new_ht, uint32_t ib_bit,
+               size_t ib_byte_size, uint32_t size)
+{
+  struct RHash build = ht_rehash_shadow(mrb, h, new_ht, new_ea, new_capa, ib_bit, ib_byte_size);
+  hash_entry *old_ea = ht_ea(h);
+  uint32_t old_capa = ht_ea_capa(h);
+  uint32_t w_size = 0;
+  ht_rehash_ctx step = { h, &build, new_ea, &w_size, NULL };
+
+  EA_EACH(old_ea, old_capa, size, r_entry) {
+    step.r_entry = r_entry;
+    ht_rehash_step(mrb, &step, new_ea, new_ht);
+  }
+  mrb_assert(w_size <= size);
+
+  h_rehash_snap_validate(mrb, snap, h);
+  if (w_size <= AR_MAX_SIZE) {
+    mrb_free(mrb, new_ht);
+    ht_rehash_install_ar(mrb, h, new_ea, w_size, new_capa);
+  }
+  else {
+    ht_rehash_install_ht(mrb, h, new_ea, new_capa, new_ht, w_size);
+  }
+}
+
+static void
+ht_rehash_to_ar(mrb_state *mrb, struct RHash *h, struct h_rehash_snap *snap)
+{
+  uint32_t size = ht_size(h);
+  hash_entry *old_ea = ht_ea(h);
+  uint32_t old_capa = ht_ea_capa(h);
+  uint32_t new_capa = size;
+  hash_entry *new_ea = (hash_entry*)mrb_malloc(mrb, sizeof(hash_entry) * new_capa);
+  for (uint32_t i = 0; i < new_capa; i++) {
+    entry_delete(&new_ea[i]);
+  }
+
+  uint32_t w_size = 0;
+  ar_rehash_ctx step = { h, new_ea, new_capa, &w_size, NULL };
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      EA_EACH(old_ea, old_capa, size, r_entry) {
+        step.r_entry = r_entry;
+        ar_rehash_step(mrb, &step, new_ea);
+      }
+      h_rehash_snap_validate(mrb, snap, h);
+      ht_rehash_install_ar(mrb, h, new_ea, w_size, new_capa);
+      mrb->jmp = prev_jmp;
+    }
+    MRB_CATCH(&c_jmp) {
+      h_rehash_frame_pop(mrb, h_rehash_frame_top(mrb));
+      mrb_free(mrb, new_ea);
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    }
+    MRB_END_EXC(&c_jmp);
+  }
+  else {
+    EA_EACH(old_ea, old_capa, size, r_entry) {
+      step.r_entry = r_entry;
+      ar_rehash_step_body(mrb, &step);
+    }
+    h_rehash_snap_validate(mrb, snap, h);
+    ht_rehash_install_ar(mrb, h, new_ea, w_size, new_capa);
+  }
+}
+
 static void
 ht_rehash(mrb_state *mrb, struct RHash *h)
 {
-  /* see comments in `h_rehash` */
   uint32_t size = ht_size(h);
+  if (size == 0) return;
+
+  struct h_rehash_snap snap = h_rehash_snap_init(mrb, h);
+  if (!snap.tbl) return;
+
   if (size <= AR_MAX_SIZE) {
-    ht_to_ar(mrb, h);
-    ar_rehash(mrb, h);
+    ht_rehash_to_ar(mrb, h, &snap);
     return;
   }
-  uint32_t w_size = 0, ea_capa = ht_ea_capa(h);
-  hash_entry *ea = ht_ea(h);
-  ht_init(mrb, h, 0, ea, ea_capa, h_ht(h), ib_bit_for(size));
-  ht_set_size(h, size);
-  ht_set_ea_n_used(h, ht_ea_n_used(h));
-  EA_EACH(ea, ea_capa, size, r_entry) {
-    /* the cycle asks this entry's own key for its hash code, and the key it
-       meets answers #eql?: Ruby in either can vacate the slot the pair is
-       still to be read from, or move the pair out of it with a compress */
-    mrb_value key = r_entry->key;
-    IB_CYCLE_BY_KEY(mrb, h, key, it) {
-      if (ib_it_active_p(it)) {
-        if (!entry_holds_key_p(mrb, h, ib_it_entry(it), key)) continue;
-        entry_check_vacated(mrb, r_entry, key);
-        ib_it_entry(it)->val = r_entry->val;
-        ht_set_size(h, --size);
-        entry_delete(r_entry);
-      }
-      else {
-        entry_check_vacated(mrb, r_entry, key);
-        if (w_size != U32(r_entry - ea)) {
-          ea_set(ea, w_size, key, r_entry->val);
-          entry_delete(r_entry);
-        }
-        ib_it_set(it, w_size++);
-      }
-      break;
-    }
+
+  uint32_t ib_bit = ib_bit_for(size);
+  size_t ib_byte_size = ib_byte_size_for(ib_bit);
+  uint32_t new_capa = ht_ea_capa(h);
+  if (new_capa < size) new_capa = size;
+  hash_entry *new_ea = (hash_entry*)mrb_malloc(mrb, sizeof(hash_entry) * new_capa);
+  for (uint32_t i = 0; i < new_capa; i++) {
+    entry_delete(&new_ea[i]);
   }
-  mrb_assert(size == w_size);
-  ht_set_ea_n_used(h, size);
-  size <= AR_MAX_SIZE ? ht_to_ar(mrb, h) : ht_adjust_ea(mrb, h, size, ea_capa);
+  hash_table *new_ht = (hash_table*)mrb_malloc(mrb, sizeof(hash_table) + ib_byte_size);
+
+  if (mrb->jmp) {
+    struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+    struct mrb_jmpbuf c_jmp;
+
+    MRB_TRY(&c_jmp) {
+      mrb->jmp = &c_jmp;
+      ht_rehash_body(mrb, h, &snap, new_ea, new_capa, new_ht, ib_bit, ib_byte_size, size);
+      mrb->jmp = prev_jmp;
+    }
+    MRB_CATCH(&c_jmp) {
+      h_rehash_frame_pop(mrb, h_rehash_frame_top(mrb));
+      mrb_free(mrb, new_ea);
+      mrb_free(mrb, new_ht);
+      mrb->jmp = prev_jmp;
+      MRB_THROW(prev_jmp);
+    }
+    MRB_END_EXC(&c_jmp);
+  }
+  else {
+    ht_rehash_body(mrb, h, &snap, new_ea, new_capa, new_ht, ib_bit, ib_byte_size, size);
+  }
 }
 
 /*
@@ -1252,8 +1556,22 @@ h_shift(mrb_state *mrb, struct RHash *h, mrb_value *keyp, mrb_value *valp)
 }
 
 static void
+h_rehash_frame_pop(mrb_state *mrb, h_rehash_frame *frame)
+{
+  if (frame && h_rehash_frame_top(mrb) == frame) {
+    mrb->ud = frame->saved_ud;
+    mrb_free(mrb, frame);
+  }
+}
+
+static void
 h_rehash(mrb_state *mrb, struct RHash *h)
 {
+  h_rehash_frame *below = h_rehash_frame_top(mrb);
+  h_rehash_frame *cursor;
+  h_rehash_frame *frame;
+
+
   /*
    * ==== Comments common to `ar_rehash` and `ht_rehash`
    *
@@ -1264,7 +1582,20 @@ h_rehash(mrb_state *mrb, struct RHash *h)
    *   delete the slot before moving when moving the entry, and update size
    *   at any time when overwriting.
    */
+  for (cursor = below; cursor; cursor = cursor->rehash_below) {
+    if (cursor->h == h) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+    }
+  }
+
+  frame = (h_rehash_frame*)mrb_malloc(mrb, sizeof(*frame));
+  frame->tag = H_REHASH_FRAME_TAG;
+  frame->saved_ud = mrb->ud;
+  frame->h = h;
+  frame->rehash_below = below;
+  mrb->ud = frame;
   (h_size(h) == 0 ? h_clear : h_ar_p(h) ? ar_rehash : ht_rehash)(mrb, h);
+  h_rehash_frame_pop(mrb, frame);
 }
 
 static void

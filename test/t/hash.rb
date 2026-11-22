@@ -1223,6 +1223,165 @@ assert('Hash scans that read the entry back after a callback') do
   assert_true(h.key?(:added))
 end
 
+assert('Hash#rehash rejects nested mutation during key callbacks') do
+  marker = []
+  swapper = Class.new do
+    attr_accessor :armed
+    def initialize(h, marker) @h, @marker, @armed = h, marker, false end
+    def fire
+      return unless @armed
+      @armed = false
+      @marker << :eql
+      @h[:d] = 0
+    end
+    def eql?(other)
+      fire
+      equal?(other)
+    end
+    def hash; end
+  end
+  h = { a: "", b: "", c: "" }
+  20.times { |i| h[i] = i }
+  k = swapper.new(h, marker)
+  h[k] = k = swapper.new(h, marker)
+  h[k] = ""
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+  assert_equal([:eql], marker)
+  h[:after_assign] = 1
+
+  grower = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      if @armed
+        @armed = false
+        40.times { |i| @h[300 + i] = i }
+      end
+      equal?(other)
+    end
+    def hash; 12_345 end
+  end
+  h = {}
+  22.times { |i| h[i] = i }
+  k = grower.new(h)
+  h[k] = 1
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  ar_pair = Class.new do
+    attr_accessor :armed
+    def initialize(h, victim) @h, @victim, @armed = h, victim, false end
+    def eql?(other)
+      if @armed && (@victim.nil? || @victim.equal?(other))
+        @armed = false
+        @h.delete(@victim || other)
+        @h[:added] = :added_value
+        @h[0] = :two
+      end
+      equal?(other)
+    end
+    def hash; 99 end
+  end
+  h = {0 => 1}
+  k = ar_pair.new(h, nil)
+  h[k] = "dup"
+  k.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  outer_mark = []
+  h1 = {}
+  20.times { |i| h1[i] = i }
+  h2 = {}
+  other = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      return equal?(other) unless @armed
+      @armed = false
+      @h.rehash
+      equal?(other)
+    end
+    def hash; end
+  end
+  k2 = other.new(h2)
+  h2[k2] = "x"
+  k2.armed = true
+  h2.rehash
+  k1 = Class.new do
+    attr_accessor :armed
+    def initialize(h, m) @h, @m = h, m, false end
+    def eql?(other)
+      return equal?(other) unless @armed
+      @armed = false
+      @m << :eql
+      @h[777] = 1
+      equal?(other)
+    end
+    def hash; end
+  end.new(h1, outer_mark)
+  h1[k1] = "y"
+  k1.armed = true
+  assert_raise(RuntimeError) { h1.rehash }
+
+  reenter_mark = []
+  reenter = Class.new do
+    attr_accessor :armed
+    def initialize(h, marker) @h, @marker, @armed = h, marker, false end
+    def eql?(other)
+      return equal?(other) unless @armed
+      @armed = false
+      @marker << :attempt
+      begin
+        @h.rehash
+      rescue RuntimeError
+        @marker << :blocked
+      end
+      equal?(other)
+    end
+    def hash; end
+  end
+  h = {}
+  20.times { |i| h[i] = i }
+  rk = reenter.new(h, reenter_mark)
+  h[rk] = "r"
+  rk.armed = true
+  h.rehash
+  assert_include(reenter_mark, :blocked)
+
+  clearer = Class.new do
+    attr_accessor :armed
+    def initialize(h) @h = h end
+    def eql?(other)
+      if @armed
+        @armed = false
+        @h.clear
+      end
+      equal?(other)
+    end
+    def hash; 13 end
+  end
+  h = {}
+  20.times { |i| h[i] = i }
+  ck = clearer.new(h)
+  h[ck] = "c"
+  ck.armed = true
+  assert_raise(RuntimeError) { h.rehash }
+
+  h = {}
+  3.times { |i| h[i] = i }
+  assert_same(h, h.rehash)
+  h = ht_entries.hash_for
+  assert_same(h, h.rehash)
+  big = {}
+  200.times { |i| big[i] = i }
+  180.times { |i| big.delete(i) }
+  assert_same(big, big.rehash)
+  cbi = { 1 => :a, "x" => :b }
+  cbi.compare_by_identity
+  assert_equal(:a, cbi[1])
+end
+
 assert('Hash scans that carry a pair into a set the hash no longer holds') do
   # A scan that stores the pair it is standing on somewhere else hands it to a
   # set, and the set asks the key for its hash code before it stores anything.
